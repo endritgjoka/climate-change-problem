@@ -41,6 +41,9 @@ MULTI_STRATEGY_MAX = 3000
 # Number of randomized (GRASP) restarts for small instances, and the
 # restricted-candidate-list size used to randomize greedy choices.
 RANDOM_RESTARTS = 120
+# All-pairs shortest paths (for the cheapest-insertion strategy) is only
+# affordable on small graphs; above this node count it is skipped.
+APSP_MAX_NODES = 400
 RCL_SIZE = 3
 # A mandatory street whose depot-loop cost exceeds this fraction of T is
 # "hard": it must be reserved on a fresh vehicle before the local greedy
@@ -93,6 +96,10 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
     # sufficient truck tier first (scarce tiers first), so heavy streets claim
     # the few large trucks before lighter work burns their budget.
     consider(*_attempt(ctx, "tier"))
+    # Cheapest-insertion construction (small graphs only) — far less deadhead,
+    # which is the binding cost on coverage-bound instances.
+    if ctx.apsp is not None:
+        consider(*_attempt_insertion(ctx))
     # Pre-placement reserves near-full streets on fresh vehicles. The right
     # "hard" threshold depends on the instance, so sweep a few values: too low
     # reserves too many vehicles, too high orphans the genuinely hard streets.
@@ -122,6 +129,16 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
             if best[0][0] == len(mandatory) and best[0][1] >= 0.999:
                 break
             consider(*_attempt(ctx, "tier", rng=rng2))
+
+        # Randomized cheapest-insertion restarts: varying the mandatory-insertion
+        # order finds an order that covers ALL mandatory while keeping the low
+        # deadhead (and thus higher coverage) this construction yields.
+        if ctx.apsp is not None:
+            rng3 = random.Random(424242)
+            for _ in range(RANDOM_RESTARTS):
+                if best[0][0] == len(mandatory) and best[0][1] >= 0.999:
+                    break
+                consider(*_attempt_insertion(ctx, rng=rng3))
     return best[1]
 
 
@@ -152,6 +169,12 @@ class _Ctx:
         # Route-improvement (per-step full Dijkstra) is only cheap on modest
         # graphs; disable it on huge instances to keep per-attempt cost bounded.
         self.improve = inst.m <= 5000
+        # All-pairs shortest-path times, used by the cheapest-insertion strategy
+        # to compute the marginal cost of splicing a street into a route. Only
+        # built for small graphs (one Dijkstra per node).
+        self.apsp = None
+        if inst.n <= APSP_MAX_NODES:
+            self.apsp = [g.dijkstra(u)[0] for u in range(inst.n)]
 
     def loop_cost(self, s):
         dirs = ((s.a, s.b),) if s.one_way else ((s.a, s.b), (s.b, s.a))
@@ -441,6 +464,126 @@ def _repair_mandatory(ctx, cleaned, vehs):
             cleaned[s.idx] = True
             v.cleaned.append(s.idx)
         # else: infeasible for the whole fleet given prior commitments.
+
+
+def _attempt_insertion(ctx, rng=None):
+    """Cheapest-insertion construction (team-orienteering style).
+
+    Routes are grown by splicing each street into the position (vehicle, slot,
+    direction) that adds the least travel time, rather than appending at the end.
+    This minimises deadheading by construction, which is the dominant cost on
+    coverage-bound instances. Mandatory streets are inserted first (hardest
+    first) to guarantee coverage; optionals then by best objective-gain per
+    inserted second. Requires all-pairs shortest paths (small graphs only).
+    """
+    inst = ctx.inst
+    D = ctx.apsp
+    T = inst.t
+    depot = inst.depot
+    alpha = inst.alpha
+    cleaned = [False] * inst.m
+
+    plans = [{"idx": i, "cap": CAPACITY[inst.vehicles[i]], "tasks": [], "time": 0}
+             for i in range(inst.c)]
+
+    def delta(plan, s, e, x, pos):
+        tasks = plan["tasks"]
+        prev_exit = depot if pos == 0 else tasks[pos - 1][2]
+        next_entry = depot if pos == len(tasks) else tasks[pos][1]
+        d1 = D[prev_exit][e]
+        d2 = D[x][next_entry]
+        if d1 == INF or d2 == INF:
+            return None
+        d0 = D[prev_exit][next_entry]
+        if d0 == INF:
+            d0 = 0
+        return d1 + s.time + d2 - d0
+
+    def directions(s):
+        return ((s.a, s.b),) if s.one_way else ((s.a, s.b), (s.b, s.a))
+
+    # ---- mandatory first (hardest first) ----
+    mand = sorted(ctx.mandatory, key=ctx.loop_cost, reverse=True)
+    if rng is not None and len(mand) > 1:
+        for _ in range(len(mand)):
+            i = rng.randrange(len(mand) - 1)
+            mand[i], mand[i + 1] = mand[i + 1], mand[i]
+    for s in mand:
+        if cleaned[s.idx]:
+            continue
+        best = None  # (key, dlt, plan, pos, e, x)
+        for plan in plans:
+            if plan["cap"] < s.req:
+                continue
+            for e, x in directions(s):
+                for pos in range(len(plan["tasks"]) + 1):
+                    dlt = delta(plan, s, e, x, pos)
+                    if dlt is None or plan["time"] + dlt > T:
+                        continue
+                    key = (dlt, plan["cap"])
+                    if best is None or key < best[0]:
+                        best = (key, dlt, plan, pos, e, x)
+        if best is not None:
+            _, dlt, plan, pos, e, x = best
+            plan["tasks"].insert(pos, (s.idx, e, x))
+            plan["time"] += dlt
+            cleaned[s.idx] = True
+
+    # ---- optionals by best objective-gain per inserted second ----
+    while True:
+        best = None  # (ratio, s, plan, pos, e, x, dlt)
+        for s in ctx.cleanable:
+            if cleaned[s.idx] or s.mandatory:
+                continue
+            cov_gain = s.length / ctx.l_max
+            for plan in plans:
+                if plan["cap"] < s.req:
+                    continue
+                eff_loss = (plan["cap"] - s.req) * s.length_km / ctx.w_max
+                obj_gain = alpha * cov_gain - (1 - alpha) * eff_loss
+                if obj_gain <= 0:
+                    continue
+                for e, x in directions(s):
+                    for pos in range(len(plan["tasks"]) + 1):
+                        dlt = delta(plan, s, e, x, pos)
+                        if dlt is None or plan["time"] + dlt > T:
+                            continue
+                        ratio = obj_gain / max(dlt, 1)
+                        if best is None or ratio > best[0]:
+                            best = (ratio, s, plan, pos, e, x, dlt)
+        if best is None:
+            break
+        _, s, plan, pos, e, x, dlt = best
+        plan["tasks"].insert(pos, (s.idx, e, x))
+        plan["time"] += dlt
+        cleaned[s.idx] = True
+
+    # ---- materialise node routes from task lists ----
+    vehs = []
+    for plan in plans:
+        v = _Veh(plan["idx"], inst.vehicles[plan["idx"]], depot)
+        cur = depot
+        for sid, e, x in plan["tasks"]:
+            if cur != e:
+                _, prev, _ = ctx.g.dijkstra(cur)
+                path = reconstruct_forward(prev, cur, e)
+                v.nodes.extend(path[1:])
+            v.nodes.append(x)
+            cur = x
+        if cur != depot:
+            v.nodes.extend(reconstruct_toward(ctx.succ_to, cur, depot)[1:])
+        v.cleaned = [sid for sid, _e, _x in plan["tasks"]]
+        v.time_used = plan["time"]
+        v.current = depot
+        vehs.append(v)
+
+    _opportunistic_clean(ctx, cleaned, vehs)
+
+    routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
+                    cleaned=v.cleaned, time_used=v.time_used) for v in vehs]
+    routes.sort(key=lambda r: r.vehicle_idx)
+    n_mand, score = _evaluate(ctx, vehs)
+    return Solution(routes=routes), n_mand, score
 
 
 def _rebuild_shorter(ctx, v):
