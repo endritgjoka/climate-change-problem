@@ -52,6 +52,21 @@ SMALL_MAX_STREETS = 200
 # Wall-clock budget (seconds) for the randomized restart phase, so large
 # instances finish quickly instead of grinding through every restart.
 TIME_BUDGET_S = 25.0
+# Extra wall-clock budget (seconds) for the LNS post-optimiser that runs once a
+# valid best solution exists. It reorganises routes (deadhead reduction) and
+# reshuffles optional cleaning to push toward the objective ceiling. The driver
+# restarts LNS from fresh diverse bases (base diversity is the main lever on
+# coverage-bound instances) and stops early once it stalls.
+LNS_BUDGET_S = 75.0
+# Per-cycle sub-budgets for the multi-base LNS driver, and how many consecutive
+# non-improving cycles to tolerate before giving up.
+LNS_BASE_S = 3.0
+LNS_CYCLE_S = 10.0
+LNS_STALL = 8
+# Only run the (expensive) multi-base LNS loop when the optimistic upper bound
+# leaves at least this much headroom over the incumbent — otherwise the polish
+# pass alone is enough and the instance is effectively at its ceiling.
+LNS_GAP_MIN = 0.07
 RCL_SIZE = 3
 # A mandatory street whose depot-loop cost exceeds this fraction of T is
 # "hard": it must be reserved on a fresh vehicle before the local greedy
@@ -181,6 +196,29 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
                     if perfect() or out_of_time():
                         break
                     consider(*_attempt_insertion(ctx, rng=rng3))
+
+    # ---- LNS post-optimisation ----
+    # Reorganise the best valid solution (deadhead-cutting route rebuilds +
+    # optional destroy/repair) toward the objective ceiling. Monotonic: a result
+    # is only adopted if it scores strictly better. The driver first polishes the
+    # incumbent, then restarts LNS from fresh diverse bases while there is real
+    # headroom (gap to the optimistic pooled upper bound) and it keeps improving.
+    if ctx.apsp is not None and best is not None and best[0][0] == len(mandatory):
+        from .lns import optimize
+        ub = _pooled_ub(ctx)
+        lns_end = _time.time() + LNS_BUDGET_S
+        lrng = random.Random(0x5EED)
+        consider(*optimize(ctx, best[1],
+                           min(_time.time() + LNS_CYCLE_S, lns_end), rng=lrng))
+        stall = 0
+        while (_time.time() < lns_end and stall < LNS_STALL
+               and ub - best[0][1] > LNS_GAP_MIN):
+            base = _attempt_large(ctx, rng=lrng,
+                                  deadline=min(_time.time() + LNS_BASE_S, lns_end))
+            prev = best[0]
+            consider(*optimize(ctx, base[0],
+                               min(_time.time() + LNS_CYCLE_S, lns_end), rng=lrng))
+            stall = 0 if best[0] > prev else stall + 1
     return best[1]
 
 
@@ -1214,6 +1252,47 @@ def _opportunistic_clean(ctx, cleaned, vehs):
             if ok:
                 cleaned[sid] = True
                 v.cleaned.append(sid)
+
+
+def _pooled_ub(ctx):
+    """Optimistic upper bound on the achievable score (a relaxation): pool all
+    vehicle time into one budget, ignore deadhead travel, force every mandatory
+    street, and add only those optionals whose *marginal* objective is positive
+    (each cleaned by the smallest capable vehicle type present), greedily by
+    objective-density until the pooled time runs out. No real routed solution
+    can exceed this, so it tells the LNS driver how much headroom is worth
+    chasing on a given instance."""
+    inst = ctx.inst
+    alpha, Lmax, Wmax = inst.alpha, ctx.l_max, ctx.w_max
+    caps = sorted(set(CAPACITY[v] for v in inst.vehicles))
+
+    def mincap(req):
+        for c in caps:
+            if c >= req:
+                return c
+        return caps[-1]
+
+    mand = ctx.mandatory
+    opt = [s for s in ctx.cleanable if not s.mandatory]
+    rem = inst.t * inst.c - sum(s.time for s in mand)
+    mand_len = sum(s.length for s in mand)
+    mand_waste = sum((mincap(s.req) - s.req) * s.length_km for s in mand)
+
+    def ds(s):
+        return alpha * (s.length / Lmax) - \
+            (1 - alpha) * ((mincap(s.req) - s.req) * s.length_km / Wmax)
+
+    pos = sorted((s for s in opt if ds(s) > 0),
+                 key=lambda s: ds(s) / max(s.time, 1), reverse=True)
+    t = inc_len = inc_waste = 0.0
+    for s in pos:
+        if t + s.time <= rem:
+            t += s.time
+            inc_len += s.length
+            inc_waste += (mincap(s.req) - s.req) * s.length_km
+    cov = (mand_len + inc_len) / Lmax
+    eff = 1 - (mand_waste + inc_waste) / Wmax
+    return alpha * cov + (1 - alpha) * eff
 
 
 def _evaluate(ctx, vehs):
