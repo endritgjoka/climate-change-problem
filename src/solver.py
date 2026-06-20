@@ -23,6 +23,7 @@ use the single fast chaining greedy.
 """
 from __future__ import annotations
 
+import heapq
 import random
 
 from .model import Instance, Route, Solution, CAPACITY
@@ -129,10 +130,19 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
 
     # ---- randomized restarts (time-budgeted) ----
     if len(mandatory) <= MULTI_STRATEGY_MAX:
+        # APSP cheapest-insertion solver — primary for large/dense instances
+        # (many streets, few nodes). Packs far more optionals than round-robin.
+        if ctx.apsp is not None and not ctx.small:
+            deadline = _start + TIME_BUDGET_S
+            consider(*_attempt_large(ctx, deadline=deadline))
+            rng_l = random.Random(20250101)
+            while not perfect() and not out_of_time():
+                consider(*_attempt_large(ctx, rng=rng_l, deadline=deadline))
+
         # Round-robin restarts (all sizes): vehicle-order shuffle varies the
         # spatial partition, closing the last few mandatory streets.
         rng_rr = random.Random(13579)
-        rr_limit = RANDOM_RESTARTS if ctx.small else 100000
+        rr_limit = RANDOM_RESTARTS if ctx.small else 30
         for _ in range(rr_limit):
             if perfect() or out_of_time():
                 break
@@ -199,12 +209,18 @@ class _Ctx:
         self.small = inst.m <= SMALL_MAX_STREETS
         # Route-improvement (per-step full Dijkstra) — small instances only.
         self.improve = self.small
-        # All-pairs shortest-path times, used by the cheapest-insertion strategy
-        # to compute the marginal cost of splicing a street into a route. Only
-        # built for small graphs (one Dijkstra per node).
+        # All-pairs shortest-path times (and predecessors for path rebuild),
+        # used by the cheapest-insertion strategies to compute the marginal cost
+        # of splicing a street into a route. Built whenever the node count is
+        # small enough — this is cheap (one Dijkstra per node) and does NOT
+        # depend on the street count, so large-M / small-N instances (like m.txt:
+        # N=200, M=1200) still get it.
         self.apsp = None
-        if self.small and inst.n <= APSP_MAX_NODES:
-            self.apsp = [g.dijkstra(u)[0] for u in range(inst.n)]
+        self.apsp_prev = None
+        if inst.n <= APSP_MAX_NODES:
+            res = [g.dijkstra(u) for u in range(inst.n)]
+            self.apsp = [r[0] for r in res]
+            self.apsp_prev = [r[1] for r in res]
 
     def loop_cost(self, s):
         dirs = ((s.a, s.b),) if s.one_way else ((s.a, s.b), (s.b, s.a))
@@ -721,6 +737,294 @@ def _attempt_insertion(ctx, rng=None):
     return Solution(routes=routes), n_mand, score
 
 
+def _attempt_large(ctx, rng=None, deadline=None):
+    """APSP-based solver for instances with few nodes but many streets (e.g.
+    m.txt: N=200, M=1200). Routes are kept as task lists ``(street, entry, exit)``
+    and costed with all-pairs shortest paths, so the marginal cost of splicing a
+    street between two consecutive tasks is O(1).
+
+    Pipeline:
+      1. Mandatory coverage — parallel round-robin (append nearest), then
+         cheapest-insertion repair for any straggler. Guarantees validity.
+      2. Optional fill — cheapest insertion ranked by objective-gain / delta,
+         driven by a lazy max-heap so it scales to hundreds of optionals.
+      3. Relocate local search — move each optional task to its cheapest slot,
+         freeing time that lets further optionals be inserted.
+
+    Objective gain uses the real scoring weights, so with alpha high (coverage
+    dominated) long optionals are inserted even by oversized trucks.
+    """
+    import time as _t
+    inst = ctx.inst
+    D = ctx.apsp
+    T = inst.t
+    depot = inst.depot
+    alpha = inst.alpha
+    Lmax = ctx.l_max
+    Wmax = ctx.w_max
+
+    order = sorted(range(inst.c), key=lambda i: -CAPACITY[inst.vehicles[i]])
+    vehs = [{"idx": i, "cap": CAPACITY[inst.vehicles[i]], "tasks": [], "time": 0.0}
+            for i in order]
+    if rng is not None:
+        rng.shuffle(vehs)
+    cleaned = [False] * inst.m
+
+    def dirs(s):
+        return ((s.a, s.b),) if s.one_way else ((s.a, s.b), (s.b, s.a))
+
+    def delta(plan, s, e, x, pos):
+        """Added route time from inserting street s (entry e, exit x) at slot pos."""
+        tasks = plan["tasks"]
+        pe = depot if pos == 0 else tasks[pos - 1][2]
+        ne = depot if pos == len(tasks) else tasks[pos][1]
+        d1 = D[pe][e]
+        if d1 == INF:
+            return None
+        d2 = D[x][ne]
+        if d2 == INF:
+            return None
+        d0 = D[pe][ne]
+        if d0 == INF:
+            d0 = 0.0
+        return d1 + s.time + d2 - d0
+
+    def best_ins(plan, s):
+        """Cheapest feasible (delta, pos, e, x) for inserting s into plan, or None."""
+        best = None
+        for e, x in dirs(s):
+            for pos in range(len(plan["tasks"]) + 1):
+                dl = delta(plan, s, e, x, pos)
+                if dl is None or plan["time"] + dl > T:
+                    continue
+                if best is None or dl < best[0]:
+                    best = (dl, pos, e, x)
+        return best
+
+    mand = ctx.mandatory
+
+    def relocate_pass():
+        """One relocation sweep: pop each task and reinsert it at its cheapest
+        slot across ANY vehicle. Shortens routes / rebalances load (frees time) —
+        the analogue of the node-level rebuild that lets tight streets fit and
+        opens room for more optionals."""
+        moved = False
+        for src in vehs:
+            i = 0
+            while i < len(src["tasks"]):
+                sid, e0, x0 = src["tasks"][i]
+                s = inst.streets[sid]
+                pe = depot if i == 0 else src["tasks"][i - 1][2]
+                ne = depot if i == len(src["tasks"]) - 1 else src["tasks"][i + 1][1]
+                cur_cost = D[pe][e0] + s.time + D[x0][ne] - D[pe][ne]
+                src["tasks"].pop(i)
+                src["time"] -= cur_cost
+                best = None  # (delta, plan, pos, e, x)
+                for p2 in vehs:
+                    if p2["cap"] < s.req:
+                        continue
+                    bi = best_ins(p2, s)
+                    if bi is None:
+                        continue
+                    if best is None or bi[0] < best[0]:
+                        best = (bi[0], p2, bi[1], bi[2], bi[3])
+                if best is not None and best[0] < cur_cost - 1e-9:
+                    dl, p2, pos, e, x = best
+                    p2["tasks"].insert(pos, (sid, e, x))
+                    p2["time"] += dl
+                    moved = True
+                    if p2 is src:
+                        i += 1  # reinserted here; step past it
+                    # else: src shrank, next task shifted into i -> don't advance
+                else:
+                    src["tasks"].insert(i, (sid, e0, x0))
+                    src["time"] += cur_cost
+                    i += 1
+        return moved
+
+    def resweep_mandatory():
+        """Round-robin append of any still-uncovered mandatory streets."""
+        active = True
+        while active:
+            active = False
+            for plan in vehs:
+                cur = depot if not plan["tasks"] else plan["tasks"][-1][2]
+                choice = None
+                for s in mand:
+                    if cleaned[s.idx] or plan["cap"] < s.req:
+                        continue
+                    for e, x in dirs(s):
+                        d = D[cur][e]
+                        if d == INF or D[x][depot] == INF:
+                            continue
+                        dl = d + s.time + D[x][depot] - D[cur][depot]
+                        if plan["time"] + dl <= T and \
+                                (choice is None or dl < choice[0]):
+                            choice = (dl, s, e, x)
+                if choice is not None:
+                    dl, s, e, x = choice
+                    plan["tasks"].append((s.idx, e, x))
+                    plan["time"] += dl
+                    cleaned[s.idx] = True
+                    active = True
+
+    def repair_mandatory():
+        """Cheapest-insertion (anywhere) for any straggler mandatory street."""
+        for s in mand:
+            if cleaned[s.idx]:
+                continue
+            cand = None
+            for plan in vehs:
+                if plan["cap"] < s.req:
+                    continue
+                bi = best_ins(plan, s)
+                if bi is None:
+                    continue
+                if cand is None or bi[0] < cand[0]:
+                    cand = (bi[0], plan, bi[1], bi[2], bi[3])
+            if cand is not None:
+                dl, plan, pos, e, x = cand
+                plan["tasks"].insert(pos, (s.idx, e, x))
+                plan["time"] += dl
+                cleaned[s.idx] = True
+
+    # ---- 1. mandatory coverage (the hard validity constraint) ----
+    # plan["time"] is the CLOSED tour time (depot -> tasks -> depot). Retry with
+    # shuffled vehicle order; within each try, compact routes (relocate) and
+    # re-sweep so tight streets fit. Keep the best-covered snapshot.
+    mrng = rng if rng is not None else random.Random(12321)
+    best_snapshot = None
+    best_nm = -1
+    for retry in range(40):
+        for plan in vehs:
+            plan["tasks"] = []
+            plan["time"] = 0.0
+        for i in range(inst.m):
+            cleaned[i] = False
+        if retry > 0:
+            mrng.shuffle(vehs)
+        resweep_mandatory()
+        repair_mandatory()
+        for _ in range(4):
+            if all(cleaned[s.idx] for s in mand):
+                break
+            moved = relocate_pass()
+            resweep_mandatory()
+            repair_mandatory()
+            if not moved:
+                break
+        nm = sum(1 for s in mand if cleaned[s.idx])
+        if nm > best_nm:
+            best_nm = nm
+            best_snapshot = [(list(p["tasks"]), p["time"]) for p in vehs]
+        if nm == len(mand):
+            break
+    # restore the best mandatory assignment found
+    for plan, (tasks, tm) in zip(vehs, best_snapshot):
+        plan["tasks"] = list(tasks)
+        plan["time"] = tm
+    for i in range(inst.m):
+        cleaned[i] = False
+    for plan in vehs:
+        for sid, _e, _x in plan["tasks"]:
+            cleaned[sid] = True
+
+    # ---- 2. optional fill: cheapest insertion by gain/delta (lazy heap) ----
+    opts = [s for s in ctx.cleanable if not s.mandatory]
+
+    def gain(s, cap):
+        return alpha * (s.length / Lmax) - \
+            (1 - alpha) * ((cap - s.req) * s.length_km / Wmax)
+
+    def best_global(s):
+        """Best (ratio, plan, pos, e, x, delta) over all vehicles, or None."""
+        best = None
+        for plan in vehs:
+            if plan["cap"] < s.req:
+                continue
+            og = gain(s, plan["cap"])
+            if og <= 0:
+                continue
+            bi = best_ins(plan, s)
+            if bi is None:
+                continue
+            dl, pos, e, x = bi
+            ratio = og / max(dl, 1.0)
+            if best is None or ratio > best[0]:
+                best = (ratio, plan, pos, e, x, dl)
+        return best
+
+    heap = []
+    for s in opts:
+        b = best_global(s)
+        if b is not None:
+            heap.append((-b[0], s.idx, s))
+    heapq.heapify(heap)
+    while heap:
+        if deadline is not None and _t.time() > deadline:
+            break
+        negr, sid, s = heapq.heappop(heap)
+        if cleaned[sid]:
+            continue
+        b = best_global(s)          # recompute fresh (routes may have changed)
+        if b is None:
+            continue
+        if -b[0] > negr + 1e-9:     # stale (worse than heap key) -> re-rank
+            heapq.heappush(heap, (-b[0], sid, s))
+            continue
+        ratio, plan, pos, e, x, dl = b
+        plan["tasks"].insert(pos, (sid, e, x))
+        plan["time"] += dl
+        cleaned[sid] = True
+
+    # ---- 3. local search: compact routes, then re-fill optionals ----
+    passes = 0
+    while passes < 3 and (deadline is None or _t.time() < deadline):
+        passes += 1
+        moved = relocate_pass()
+        # spend any freed time on more optionals (cheapest insertion)
+        added = False
+        for s in opts:
+            if deadline is not None and _t.time() > deadline:
+                break
+            if cleaned[s.idx]:
+                continue
+            b = best_global(s)
+            if b is not None:
+                _ratio, plan, pos, e, x, dl = b
+                plan["tasks"].insert(pos, (s.idx, e, x))
+                plan["time"] += dl
+                cleaned[s.idx] = True
+                added = True
+        if not moved and not added:
+            break
+
+    # ---- materialise node routes ----
+    vehs_out = []
+    for plan in vehs:
+        v = _Veh(plan["idx"], inst.vehicles[plan["idx"]], depot)
+        cur = depot
+        for sid, e, x in plan["tasks"]:
+            if cur != e:
+                v.nodes.extend(reconstruct_forward(ctx.apsp_prev[cur], cur, e)[1:])
+            v.nodes.append(x)
+            cur = x
+        if cur != depot:
+            v.nodes.extend(reconstruct_forward(ctx.apsp_prev[cur], cur, depot)[1:])
+        v.cleaned = [sid for sid, _e, _x in plan["tasks"]]
+        v.time_used = plan["time"]  # already the closed-tour time (incl. return)
+        v.current = depot
+        vehs_out.append(v)
+
+    _opportunistic_clean(ctx, cleaned, vehs_out)
+
+    routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
+                    cleaned=v.cleaned, time_used=v.time_used) for v in vehs_out]
+    routes.sort(key=lambda r: r.vehicle_idx)
+    n_mand, score = _evaluate(ctx, vehs_out)
+    return Solution(routes=routes), n_mand, score
+
+
 def _rebuild_shorter(ctx, v):
     """Re-route vehicle v over its CURRENT cleaned set via nearest-neighbour,
     keeping every cleaned street but minimising deadhead. Adopts the new route
@@ -773,6 +1077,41 @@ def _rebuild_shorter(ctx, v):
     v.time_used = time_used
     v.current = cur
     return True
+
+
+def _reassign_cleaners(ctx, vehs):
+    """Pure-efficiency post-process: for each cleaned street, assign the cleaning
+    to the smallest-capacity vehicle that already traverses it. Coverage and route
+    times are unchanged (same streets, same paths) — only water waste drops, since
+    a street cleaned by an oversized truck moves to a smaller sufficient one that
+    happens to pass through it."""
+    inst = ctx.inst
+    em = ctx.edge_map
+    trav = []
+    for v in vehs:
+        ts = set()
+        for a, b in zip(v.nodes, v.nodes[1:]):
+            sid = em.get((a, b))
+            if sid is not None:
+                ts.add(sid)
+        trav.append(ts)
+    cleaned_streets = set()
+    for v in vehs:
+        cleaned_streets.update(v.cleaned)
+    new_cleaned = [[] for _ in vehs]
+    for sid in cleaned_streets:
+        req = inst.streets[sid].req
+        best_vi = None
+        best_cap = None
+        for vi, v in enumerate(vehs):
+            if v.cap >= req and sid in trav[vi]:
+                if best_cap is None or v.cap < best_cap:
+                    best_cap = v.cap
+                    best_vi = vi
+        if best_vi is not None:
+            new_cleaned[best_vi].append(sid)
+    for vi, v in enumerate(vehs):
+        v.cleaned = new_cleaned[vi]
 
 
 def _opportunistic_clean(ctx, cleaned, vehs):
