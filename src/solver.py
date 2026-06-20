@@ -44,6 +44,13 @@ RANDOM_RESTARTS = 120
 # All-pairs shortest paths (for the cheapest-insertion strategy) is only
 # affordable on small graphs; above this node count it is skipped.
 APSP_MAX_NODES = 400
+# Instances with at most this many streets use the expensive high-quality
+# strategies (route rebuild, cheapest insertion). Larger instances use the fast
+# chaining greedy + repair so runtime stays bounded.
+SMALL_MAX_STREETS = 200
+# Wall-clock budget (seconds) for the randomized restart phase, so large
+# instances finish quickly instead of grinding through every restart.
+TIME_BUDGET_S = 25.0
 RCL_SIZE = 3
 # A mandatory street whose depot-loop cost exceeds this fraction of T is
 # "hard": it must be reserved on a fresh vehicle before the local greedy
@@ -65,6 +72,8 @@ class _Veh:
 
 
 def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
+    import time as _time
+    _start = _time.time()
     g = Graph(inst)
     dist_to_depot, succ_to = g.dijkstra_to(inst.depot)
     dist_from, prev_from, _ = g.dijkstra(inst.depot)
@@ -90,55 +99,72 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
         if best is None or key > best[0]:
             best = (key, sol)
 
+    def perfect():
+        return best[0][0] == len(mandatory) and best[0][1] >= 0.999
+
+    def out_of_time():
+        return _time.time() - _start > TIME_BUDGET_S
+
+    # ---- cheap deterministic constructions (all instance sizes) ----
     consider(*_attempt(ctx, "local_asc"))
     consider(*_attempt(ctx, "local_desc"))
+    # Round-robin parallel coverage — the workhorse for large instances; low
+    # deadhead means it covers all mandatory where sequential greedy strands some.
+    consider(*_attempt_rr(ctx))
     # Capacity-tier reservation: assign each mandatory street to the smallest
     # sufficient truck tier first (scarce tiers first), so heavy streets claim
     # the few large trucks before lighter work burns their budget.
     consider(*_attempt(ctx, "tier"))
-    # Cheapest-insertion construction (small graphs only) — far less deadhead,
-    # which is the binding cost on coverage-bound instances.
-    if ctx.apsp is not None:
-        consider(*_attempt_insertion(ctx))
-    # Pre-placement reserves near-full streets on fresh vehicles. The right
-    # "hard" threshold depends on the instance, so sweep a few values: too low
-    # reserves too many vehicles, too high orphans the genuinely hard streets.
-    # hard_frac=0 reserves *every* mandatory street up-front via hardest-first
-    # best-insertion — the most robust path to full mandatory coverage (the hard
-    # constraint that zeroes the score if missed).
-    for hf in (0.0, 0.25, 0.5, 0.65, 0.8):
-        consider(*_attempt(ctx, "preplace_asc", hard_frac=hf))
-        consider(*_attempt(ctx, "preplace_desc", hard_frac=hf))
 
-    # Randomized GRASP restarts help tight, travel-bound instances escape the
-    # orphans a deterministic greedy leaves behind. Cheap on small instances.
-    if len(mandatory) <= MULTI_STRATEGY_MAX:
-        rng = random.Random(20240607)
-        for _ in range(RANDOM_RESTARTS):
-            if best[0][0] == len(mandatory) and best[0][1] >= 0.999:
-                break  # already perfect
-            hf = rng.uniform(0.0, 0.85)
-            strat = "preplace_asc" if rng.random() < 0.5 else "preplace_desc"
-            consider(*_attempt(ctx, strat, rng=rng, hard_frac=hf))
-
-        # Tier-reservation restarts run on a *separate* RNG so they never
-        # perturb the stream above (keeps prior results monotonic: best-of can
-        # only improve). The shuffled placement order varies packing per try.
-        rng2 = random.Random(990001)
-        for _ in range(RANDOM_RESTARTS):
-            if best[0][0] == len(mandatory) and best[0][1] >= 0.999:
-                break
-            consider(*_attempt(ctx, "tier", rng=rng2))
-
-        # Randomized cheapest-insertion restarts: varying the mandatory-insertion
-        # order finds an order that covers ALL mandatory while keeping the low
-        # deadhead (and thus higher coverage) this construction yields.
+    # ---- expensive high-quality constructions (small instances only) ----
+    if ctx.small:
+        # Cheapest-insertion: far less deadhead, best on coverage-bound instances.
         if ctx.apsp is not None:
-            rng3 = random.Random(424242)
+            consider(*_attempt_insertion(ctx))
+        # Pre-placement reserves budget-hungry mandatory on fresh vehicles. Sweep
+        # the "hard" threshold; hard_frac=0 reserves every mandatory up-front.
+        for hf in (0.0, 0.25, 0.5, 0.65, 0.8):
+            consider(*_attempt(ctx, "preplace_asc", hard_frac=hf))
+            consider(*_attempt(ctx, "preplace_desc", hard_frac=hf))
+
+    # ---- randomized restarts (time-budgeted) ----
+    if len(mandatory) <= MULTI_STRATEGY_MAX:
+        # Round-robin restarts (all sizes): vehicle-order shuffle varies the
+        # spatial partition, closing the last few mandatory streets.
+        rng_rr = random.Random(13579)
+        rr_limit = RANDOM_RESTARTS if ctx.small else 100000
+        for _ in range(rr_limit):
+            if perfect() or out_of_time():
+                break
+            consider(*_attempt_rr(ctx, rng=rng_rr))
+
+        # The remaining restart families are expensive per-attempt and only pay
+        # off on small instances; large instances rely on round-robin above.
+        if ctx.small:
+            rng = random.Random(20240607)
             for _ in range(RANDOM_RESTARTS):
-                if best[0][0] == len(mandatory) and best[0][1] >= 0.999:
+                if perfect() or out_of_time():
                     break
-                consider(*_attempt_insertion(ctx, rng=rng3))
+                hf = rng.uniform(0.0, 0.85)
+                strat = "preplace_asc" if rng.random() < 0.5 else "preplace_desc"
+                consider(*_attempt(ctx, strat, rng=rng, hard_frac=hf))
+
+            # Separate RNG so this never perturbs the stream above (best-of stays
+            # monotonic). Shuffled placement order varies packing per try.
+            rng2 = random.Random(990001)
+            for _ in range(RANDOM_RESTARTS):
+                if perfect() or out_of_time():
+                    break
+                consider(*_attempt(ctx, "tier", rng=rng2))
+
+            # Cheapest-insertion restarts: varying the mandatory-insertion order
+            # finds an order covering all mandatory while keeping low deadhead.
+            if ctx.apsp is not None:
+                rng3 = random.Random(424242)
+                for _ in range(RANDOM_RESTARTS):
+                    if perfect() or out_of_time():
+                        break
+                    consider(*_attempt_insertion(ctx, rng=rng3))
     return best[1]
 
 
@@ -166,14 +192,18 @@ class _Ctx:
             if not s.one_way:
                 em[(s.b, s.a)] = s.idx
         self.edge_map = em
-        # Route-improvement (per-step full Dijkstra) is only cheap on modest
-        # graphs; disable it on huge instances to keep per-attempt cost bounded.
-        self.improve = inst.m <= 5000
+        # "Small" instances can afford the expensive high-quality strategies
+        # (per-step route rebuild, all-pairs cheapest insertion). On large
+        # instances these are quadratic-ish per attempt and dominate runtime, so
+        # they are gated off in favour of the fast chaining greedy + repair.
+        self.small = inst.m <= SMALL_MAX_STREETS
+        # Route-improvement (per-step full Dijkstra) — small instances only.
+        self.improve = self.small
         # All-pairs shortest-path times, used by the cheapest-insertion strategy
         # to compute the marginal cost of splicing a street into a route. Only
         # built for small graphs (one Dijkstra per node).
         self.apsp = None
-        if inst.n <= APSP_MAX_NODES:
+        if self.small and inst.n <= APSP_MAX_NODES:
             self.apsp = [g.dijkstra(u)[0] for u in range(inst.n)]
 
     def loop_cost(self, s):
@@ -464,6 +494,111 @@ def _repair_mandatory(ctx, cleaned, vehs):
             cleaned[s.idx] = True
             v.cleaned.append(s.idx)
         # else: infeasible for the whole fleet given prior commitments.
+
+
+def _roundrobin_pass(ctx, cleaned, vehs, want_mandatory):
+    """Advance all vehicles in parallel: each round, every vehicle takes the one
+    best street it can still service and return from. Unlike the sequential
+    greedy (which lets one vehicle claim a whole region before the next starts),
+    this keeps vehicles spread across the map, slashing deadhead — the key to
+    covering all mandatory streets on large instances.
+
+    Mandatory picks the nearest street (minimise added time); optional picks the
+    best objective-gain per second.
+    """
+    inst, g = ctx.inst, ctx.g
+    T = inst.t
+    alpha = inst.alpha
+    active = True
+    while active:
+        active = False
+        for v in vehs:
+            remaining = T - v.time_used
+            if remaining <= 0:
+                continue
+            dist, prev, settled = g.dijkstra(v.current, cutoff=remaining,
+                                             max_pops=ctx.pop_limit)
+            best = None  # (key, s, entry, exit, cost)
+            for node in settled:
+                reach = dist[node]
+                for s in ctx.inc[node]:
+                    if cleaned[s.idx] or v.cap < s.req:
+                        continue
+                    if s.mandatory != want_mandatory:
+                        continue
+                    exit = s.b if node == s.a else s.a
+                    ret = ctx.dist_to_depot[exit]
+                    if ret == INF or reach + s.time + ret > remaining:
+                        continue
+                    cost = reach + s.time
+                    if want_mandatory:
+                        if best is None or cost < best[0]:
+                            best = (cost, s, node, exit, cost)
+                    else:
+                        waste = (v.cap - s.req) * s.length_km
+                        og = alpha * (s.length / ctx.l_max) - \
+                            (1 - alpha) * (waste / ctx.w_max)
+                        if og <= 0:
+                            continue
+                        key = og / max(cost, 1)
+                        if best is None or key > best[0]:
+                            best = (key, s, node, exit, cost)
+            if best is not None:
+                _key, s, node, exit, cost = best
+                path = reconstruct_forward(prev, v.current, node)
+                v.nodes.extend(path[1:])
+                v.nodes.append(exit)
+                cleaned[s.idx] = True
+                v.cleaned.append(s.idx)
+                v.time_used += cost
+                v.current = exit
+                active = True
+
+
+def _attempt_rr(ctx, rng=None):
+    """Round-robin construction: parallel nearest-street coverage with rebuild.
+
+    The most reliable strategy for large instances. Mandatory is covered in
+    parallel (low deadhead), stragglers recovered by rebuilding routes to free
+    time and re-sweeping, then optionals fill the remainder. Randomising the
+    vehicle processing order across restarts varies the spatial partition and
+    closes the last few mandatory streets.
+    """
+    inst = ctx.inst
+    depot = inst.depot
+    order = sorted(range(inst.c), key=lambda i: -CAPACITY[inst.vehicles[i]])
+    vehs = [_Veh(i, inst.vehicles[i], depot) for i in order]
+    if rng is not None:
+        rng.shuffle(vehs)
+    cleaned = [False] * inst.m
+
+    _roundrobin_pass(ctx, cleaned, vehs, want_mandatory=True)
+    _repair_mandatory(ctx, cleaned, vehs)
+    # Rebuild routes to free time, then re-sweep to recover straggler mandatory.
+    for _ in range(3):
+        improved = False
+        for v in vehs:
+            if _rebuild_shorter(ctx, v):
+                improved = True
+        if not improved:
+            break
+        _roundrobin_pass(ctx, cleaned, vehs, want_mandatory=True)
+        _repair_mandatory(ctx, cleaned, vehs)
+
+    _roundrobin_pass(ctx, cleaned, vehs, want_mandatory=False)
+
+    for v in vehs:
+        if v.current != depot:
+            v.nodes.extend(reconstruct_toward(ctx.succ_to, v.current, depot)[1:])
+            v.time_used += ctx.dist_to_depot[v.current]
+            v.current = depot
+    _opportunistic_clean(ctx, cleaned, vehs)
+
+    routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
+                    cleaned=v.cleaned, time_used=v.time_used) for v in vehs]
+    routes.sort(key=lambda r: r.vehicle_idx)
+    n_mand, score = _evaluate(ctx, vehs)
+    return Solution(routes=routes), n_mand, score
 
 
 def _attempt_insertion(ctx, rng=None):
