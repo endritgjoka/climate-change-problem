@@ -41,7 +41,7 @@ POP_LIMIT = 400
 MULTI_STRATEGY_MAX = 3000
 # Number of randomized (GRASP) restarts for small instances, and the
 # restricted-candidate-list size used to randomize greedy choices.
-RANDOM_RESTARTS = 120
+RANDOM_RESTARTS = 1000
 # All-pairs shortest paths (for the cheapest-insertion strategy) is only
 # affordable on small graphs; above this node count it is skipped.
 APSP_MAX_NODES = 400
@@ -130,14 +130,20 @@ def solve(inst: Instance, pop_limit: int = POP_LIMIT) -> Solution:
 
     # ---- randomized restarts (time-budgeted) ----
     if len(mandatory) <= MULTI_STRATEGY_MAX:
-        # APSP cheapest-insertion solver — primary for large/dense instances
-        # (many streets, few nodes). Packs far more optionals than round-robin.
-        if ctx.apsp is not None and not ctx.small:
-            deadline = _start + TIME_BUDGET_S
-            consider(*_attempt_large(ctx, deadline=deadline))
+        # APSP cheapest-insertion + relocate solver. It minimises deadhead by
+        # construction, so it dominates on coverage-bound, time-tight instances
+        # (vehicles pinned at the time limit, where the only way to clean more is
+        # to travel less). On large/dense instances it is the primary engine and
+        # gets the whole budget. On small instances it is an *extra* candidate
+        # given a slice of the budget — the small-only families below get the
+        # rest. best-of (consider) keeps the winner, so this only ever helps.
+        if ctx.apsp is not None:
+            large_deadline = (_start + TIME_BUDGET_S if not ctx.small
+                              else _start + min(TIME_BUDGET_S * 0.3, 6.0))
+            consider(*_attempt_large(ctx, deadline=large_deadline))
             rng_l = random.Random(20250101)
-            while not perfect() and not out_of_time():
-                consider(*_attempt_large(ctx, rng=rng_l, deadline=deadline))
+            while not perfect() and _time.time() < large_deadline:
+                consider(*_attempt_large(ctx, rng=rng_l, deadline=large_deadline))
 
         # Round-robin restarts (all sizes): vehicle-order shuffle varies the
         # spatial partition, closing the last few mandatory streets.
