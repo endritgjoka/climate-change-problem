@@ -42,11 +42,21 @@ def run_one(in_path: str) -> None:
     print(f"  -> wrote {out_path}\n")
 
 
+def resolve_input_path(arg: str) -> str:
+    """Accept either a path or a bare input/ filename."""
+    if os.path.exists(arg):
+        return arg
+    candidate = os.path.join(INPUT_DIR, arg)
+    if os.path.exists(candidate):
+        return candidate
+    return arg
+
+
 def main(argv):
     args = [a for a in argv if not a.startswith("--")]
 
     if args:
-        targets = args
+        targets = [resolve_input_path(a) for a in args]
     else:
         if not os.path.isdir(INPUT_DIR):
             print(f"no input/ directory and no files given")
