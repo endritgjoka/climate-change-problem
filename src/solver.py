@@ -291,6 +291,9 @@ def _attempt(ctx, strategy, rng=None, hard_frac=HARD_FRAC):
     # ---- Phase 4: opportunistic cleaning along existing routes ----
     # Clean cleanable streets a vehicle already traverses, at zero extra time.
     _opportunistic_clean(ctx, cleaned, vehs)
+    # Zero-cost efficiency: hand each cleaning to the smallest-capacity vehicle
+    # that already traverses the street (cuts water waste, coverage unchanged).
+    _reassign_cleaners(ctx, vehs)
 
     routes = []
     for v in vehs:
@@ -609,6 +612,7 @@ def _attempt_rr(ctx, rng=None):
             v.time_used += ctx.dist_to_depot[v.current]
             v.current = depot
     _opportunistic_clean(ctx, cleaned, vehs)
+    _reassign_cleaners(ctx, vehs)
 
     routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
                     cleaned=v.cleaned, time_used=v.time_used) for v in vehs]
@@ -729,6 +733,7 @@ def _attempt_insertion(ctx, rng=None):
         vehs.append(v)
 
     _opportunistic_clean(ctx, cleaned, vehs)
+    _reassign_cleaners(ctx, vehs)
 
     routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
                     cleaned=v.cleaned, time_used=v.time_used) for v in vehs]
@@ -839,6 +844,58 @@ def _attempt_large(ctx, rng=None, deadline=None):
                 else:
                     src["tasks"].insert(i, (sid, e0, x0))
                     src["time"] += cur_cost
+                    i += 1
+        return moved
+
+    def oropt_pass(seg_len):
+        """Or-opt: relocate a run of `seg_len` consecutive tasks as a single
+        block to its cheapest slot across any vehicle. The block keeps its order
+        and per-street directions (no reversal), so it stays valid for one-way
+        streets; only the two connector arcs at the block's ends change. Catches
+        deadhead that single-task relocation can't untangle (e.g. a pair of jobs
+        that belong together but landed on the wrong vehicle), freeing time for
+        the optional refill that follows."""
+        moved = False
+        for src in vehs:
+            i = 0
+            while i + seg_len <= len(src["tasks"]):
+                block = src["tasks"][i:i + seg_len]
+                ef = block[0][1]            # entry of first task
+                xl = block[-1][2]           # exit of last task
+                # time that travels with the block (task times + internal arcs)
+                block_const = sum(inst.streets[sid].time for sid, _e, _x in block)
+                for j in range(seg_len - 1):
+                    block_const += D[block[j][2]][block[j + 1][1]]
+                maxreq = max(inst.streets[sid].req for sid, _e, _x in block)
+                pe = depot if i == 0 else src["tasks"][i - 1][2]
+                ne = depot if i + seg_len == len(src["tasks"]) \
+                    else src["tasks"][i + seg_len][1]
+                rem = D[pe][ef] + D[xl][ne] - D[pe][ne]   # connector cost removed
+                del src["tasks"][i:i + seg_len]
+                src["time"] -= rem + block_const
+                best = None  # (ins_connect, plan, pos)
+                for p2 in vehs:
+                    if p2["cap"] < maxreq:
+                        continue
+                    for pos in range(len(p2["tasks"]) + 1):
+                        pe2 = depot if pos == 0 else p2["tasks"][pos - 1][2]
+                        ne2 = depot if pos == len(p2["tasks"]) else p2["tasks"][pos][1]
+                        ic = D[pe2][ef] + D[xl][ne2] - D[pe2][ne2]
+                        if ic == INF or p2["time"] + ic + block_const > T:
+                            continue
+                        if best is None or ic < best[0]:
+                            best = (ic, p2, pos)
+                if best is not None and best[0] < rem - 1e-9:
+                    ic, p2, pos = best
+                    p2["tasks"][pos:pos] = block
+                    p2["time"] += ic + block_const
+                    moved = True
+                    if p2 is src and pos <= i:
+                        i += seg_len  # block landed at/before i; step past it
+                    # otherwise the slot at i shifted; re-examine it
+                else:
+                    src["tasks"][i:i] = block
+                    src["time"] += rem + block_const
                     i += 1
         return moved
 
@@ -982,6 +1039,11 @@ def _attempt_large(ctx, rng=None, deadline=None):
     while passes < 3 and (deadline is None or _t.time() < deadline):
         passes += 1
         moved = relocate_pass()
+        # Or-opt block moves catch deadhead single-task relocation misses.
+        if oropt_pass(2):
+            moved = True
+        if oropt_pass(3):
+            moved = True
         # spend any freed time on more optionals (cheapest insertion)
         added = False
         for s in opts:
@@ -1017,6 +1079,7 @@ def _attempt_large(ctx, rng=None, deadline=None):
         vehs_out.append(v)
 
     _opportunistic_clean(ctx, cleaned, vehs_out)
+    _reassign_cleaners(ctx, vehs_out)
 
     routes = [Route(vehicle_idx=v.idx, vtype=v.vtype, nodes=v.nodes,
                     cleaned=v.cleaned, time_used=v.time_used) for v in vehs_out]
